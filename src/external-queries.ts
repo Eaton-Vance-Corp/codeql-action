@@ -1,8 +1,10 @@
 import * as fs from "fs";
 import * as path from "path";
 
-import * as toolrunnner from "@actions/exec/lib/toolrunner";
+import * as toolrunner from "@actions/exec/lib/toolrunner";
+import * as safeWhich from "@chrisgavin/safe-which";
 
+import { GitHubApiExternalRepoDetails } from "./api-client";
 import { Logger } from "./logging";
 
 /**
@@ -11,7 +13,7 @@ import { Logger } from "./logging";
 export async function checkoutExternalRepository(
   repository: string,
   ref: string,
-  githubUrl: string,
+  apiDetails: GitHubApiExternalRepoDetails,
   tempDir: string,
   logger: Logger
 ): Promise<string> {
@@ -27,13 +29,13 @@ export async function checkoutExternalRepository(
   }
 
   if (!fs.existsSync(checkoutLocation)) {
-    const repoURL = `${githubUrl}/${repository}`;
-    await new toolrunnner.ToolRunner("git", [
+    const repoCloneURL = buildCheckoutURL(repository, apiDetails);
+    await new toolrunner.ToolRunner(await safeWhich.safeWhich("git"), [
       "clone",
-      repoURL,
+      repoCloneURL,
       checkoutLocation,
     ]).exec();
-    await new toolrunnner.ToolRunner("git", [
+    await new toolrunner.ToolRunner(await safeWhich.safeWhich("git"), [
       `--work-tree=${checkoutLocation}`,
       `--git-dir=${checkoutLocation}/.git`,
       "checkout",
@@ -42,4 +44,20 @@ export async function checkoutExternalRepository(
   }
 
   return checkoutLocation;
+}
+
+export function buildCheckoutURL(
+  repository: string,
+  apiDetails: GitHubApiExternalRepoDetails
+): string {
+  const repoCloneURL = new URL(apiDetails.url);
+  if (apiDetails.externalRepoAuth !== undefined) {
+    repoCloneURL.username = "x-access-token";
+    repoCloneURL.password = apiDetails.externalRepoAuth;
+  }
+  if (!repoCloneURL.pathname.endsWith("/")) {
+    repoCloneURL.pathname += "/";
+  }
+  repoCloneURL.pathname += `${repository}`;
+  return repoCloneURL.toString();
 }

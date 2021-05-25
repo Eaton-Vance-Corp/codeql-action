@@ -1,15 +1,22 @@
+import * as fs from "fs";
+import * as path from "path";
+
 import * as core from "@actions/core";
 
 import * as actionsUtil from "./actions-util";
 import {
-  AnalysisStatusReport,
   runAnalyze,
   CodeQLAnalysisError,
+  QueriesStatusReport,
 } from "./analyze";
-import { getConfig } from "./config-utils";
+import { Config, getConfig } from "./config-utils";
 import { getActionsLogger } from "./logging";
-import { parseRepositoryNwo } from "./repository";
+import * as upload_lib from "./upload-lib";
 import * as util from "./util";
+
+interface AnalysisStatusReport
+  extends upload_lib.UploadStatusReport,
+    QueriesStatusReport {}
 
 interface FinishStatusReport
   extends actionsUtil.StatusReportBase,
@@ -41,6 +48,7 @@ async function sendStatusReport(
 async function run() {
   const startedAt = new Date();
   let stats: AnalysisStatusReport | undefined = undefined;
+  let config: Config | undefined = undefined;
   try {
     actionsUtil.prepareLocalRunEnvironment();
     if (
@@ -49,42 +57,44 @@ async function run() {
           "finish",
           "starting",
           startedAt
-        ),
-        true
+        )
       ))
     ) {
       return;
     }
     const logger = getActionsLogger();
-    const config = await getConfig(
-      actionsUtil.getRequiredEnvParam("RUNNER_TEMP"),
-      logger
-    );
+    config = await getConfig(actionsUtil.getTemporaryDirectory(), logger);
     if (config === undefined) {
       throw new Error(
         "Config file could not be found at expected location. Has the 'init' action been called?"
       );
     }
-    stats = await runAnalyze(
-      parseRepositoryNwo(actionsUtil.getRequiredEnvParam("GITHUB_REPOSITORY")),
-      await actionsUtil.getCommitOid(),
-      await actionsUtil.getRef(),
-      await actionsUtil.getAnalysisKey(),
-      actionsUtil.getRequiredEnvParam("GITHUB_WORKFLOW"),
-      actionsUtil.getWorkflowRunID(),
-      actionsUtil.getRequiredInput("checkout_path"),
-      actionsUtil.getRequiredInput("matrix"),
-      actionsUtil.getRequiredInput("token"),
-      actionsUtil.getRequiredEnvParam("GITHUB_SERVER_URL"),
-      actionsUtil.getRequiredInput("upload") === "true",
-      "actions",
-      actionsUtil.getRequiredInput("output"),
+    const apiDetails = {
+      auth: actionsUtil.getRequiredInput("token"),
+      url: actionsUtil.getRequiredEnvParam("GITHUB_SERVER_URL"),
+    };
+    const outputDir = actionsUtil.getRequiredInput("output");
+    const queriesStats = await runAnalyze(
+      outputDir,
       util.getMemoryFlag(actionsUtil.getOptionalInput("ram")),
       util.getAddSnippetsFlag(actionsUtil.getRequiredInput("add-snippets")),
       util.getThreadsFlag(actionsUtil.getOptionalInput("threads"), logger),
       config,
       logger
     );
+
+    if (actionsUtil.getRequiredInput("upload") === "true") {
+      const uploadStats = await upload_lib.uploadFromActions(
+        outputDir,
+        config.gitHubVersion,
+        apiDetails,
+        logger
+      );
+      stats = { ...queriesStats, ...uploadStats };
+    } else {
+      logger.info("Not uploading results");
+      stats = { ...queriesStats };
+    }
   } catch (error) {
     core.setFailed(error.message);
     console.log(error);
@@ -95,12 +105,47 @@ async function run() {
 
     await sendStatusReport(startedAt, stats, error);
     return;
+  } finally {
+    if (core.isDebug() && config !== undefined) {
+      core.info("Debug mode is on. Printing CodeQL debug logs...");
+      for (const language of config.languages) {
+        const databaseDirectory = util.getCodeQLDatabasePath(
+          config.tempDir,
+          language
+        );
+        const logsDirectory = path.join(databaseDirectory, "log");
+
+        const walkLogFiles = (dir: string) => {
+          const entries = fs.readdirSync(dir, { withFileTypes: true });
+          for (const entry of entries) {
+            if (entry.isFile()) {
+              core.startGroup(
+                `CodeQL Debug Logs - ${language} - ${entry.name}`
+              );
+              process.stdout.write(
+                fs.readFileSync(path.resolve(dir, entry.name))
+              );
+              core.endGroup();
+            } else if (entry.isDirectory()) {
+              walkLogFiles(path.resolve(dir, entry.name));
+            }
+          }
+        };
+        walkLogFiles(logsDirectory);
+      }
+    }
   }
 
   await sendStatusReport(startedAt, stats);
 }
 
-run().catch((e) => {
-  core.setFailed(`analyze action failed: ${e}`);
-  console.log(e);
-});
+async function runWrapper() {
+  try {
+    await run();
+  } catch (error) {
+    core.setFailed(`analyze action failed: ${error}`);
+    console.log(error);
+  }
+}
+
+void runWrapper();

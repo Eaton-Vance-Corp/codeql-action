@@ -1,16 +1,14 @@
 import * as fs from "fs";
 import * as path from "path";
 
-import * as toolrunnner from "@actions/exec/lib/toolrunner";
+import * as toolrunner from "@actions/exec/lib/toolrunner";
 
 import * as analysisPaths from "./analysis-paths";
 import { getCodeQL } from "./codeql";
 import * as configUtils from "./config-utils";
 import { isScannedLanguage, Language } from "./languages";
 import { Logger } from "./logging";
-import { RepositoryNwo } from "./repository";
 import * as sharedEnv from "./shared-environment";
-import * as upload_lib from "./upload-lib";
 import * as util from "./util";
 
 export class CodeQLAnalysisError extends Error {
@@ -49,13 +47,9 @@ export interface QueriesStatusReport {
   analyze_custom_queries_javascript_duration_ms?: number;
   // Time taken in ms to analyze custom queries for python (or undefined if this language was not analyzed)
   analyze_custom_queries_python_duration_ms?: number;
-  // Name of language that errored during analysis (or undefined if no langauge failed)
+  // Name of language that errored during analysis (or undefined if no language failed)
   analyze_failure_language?: string;
 }
-
-export interface AnalysisStatusReport
-  extends upload_lib.UploadStatusReport,
-    QueriesStatusReport {}
 
 async function setupPythonExtractor(logger: Logger) {
   const codeqlPython = process.env["CODEQL_PYTHON"];
@@ -73,7 +67,7 @@ async function setupPythonExtractor(logger: Logger) {
     },
   };
 
-  await new toolrunnner.ToolRunner(
+  await new toolrunner.ToolRunner(
     codeqlPython,
     [
       "-c",
@@ -85,7 +79,7 @@ async function setupPythonExtractor(logger: Logger) {
   process.env["LGTM_INDEX_IMPORT_PATH"] = output;
 
   output = "";
-  await new toolrunnner.ToolRunner(
+  await new toolrunner.ToolRunner(
     codeqlPython,
     ["-c", "import sys; print(sys.version_info[0])"],
     options
@@ -216,25 +210,13 @@ export async function runQueries(
 }
 
 export async function runAnalyze(
-  repositoryNwo: RepositoryNwo,
-  commitOid: string,
-  ref: string,
-  analysisKey: string | undefined,
-  analysisName: string | undefined,
-  workflowRunID: number | undefined,
-  checkoutPath: string,
-  environment: string | undefined,
-  githubAuth: string,
-  githubUrl: string,
-  doUpload: boolean,
-  mode: util.Mode,
   outputDir: string,
   memoryFlag: string,
   addSnippetsFlag: string,
   threadsFlag: string,
   config: configUtils.Config,
   logger: Logger
-): Promise<AnalysisStatusReport> {
+): Promise<QueriesStatusReport> {
   // Delete the tracer config env var to avoid tracing ourselves
   delete process.env[sharedEnv.ODASA_TRACER_CONFIGURATION];
 
@@ -253,26 +235,5 @@ export async function runAnalyze(
     logger
   );
 
-  if (!doUpload) {
-    logger.info("Not uploading results");
-    return { ...queriesStats };
-  }
-
-  const uploadStats = await upload_lib.upload(
-    outputDir,
-    repositoryNwo,
-    commitOid,
-    ref,
-    analysisKey,
-    analysisName,
-    workflowRunID,
-    checkoutPath,
-    environment,
-    githubAuth,
-    githubUrl,
-    mode,
-    logger
-  );
-
-  return { ...queriesStats, ...uploadStats };
+  return { ...queriesStats };
 }

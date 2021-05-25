@@ -14,10 +14,13 @@ import { getRunnerLogger } from "./logging";
 import { parseRepositoryNwo } from "./repository";
 import * as upload_lib from "./upload-lib";
 import {
+  checkGitHubVersionInRange,
   getAddSnippetsFlag,
+  getGitHubVersion,
   getMemoryFlag,
   getThreadsFlag,
   parseGithubUrl,
+  getGitHubAuth,
 } from "./util";
 
 const program = new Command();
@@ -94,6 +97,7 @@ interface InitArgs {
   repository: string;
   githubUrl: string;
   githubAuth: string;
+  githubAuthStdin: boolean;
   debug: boolean;
 }
 
@@ -102,9 +106,13 @@ program
   .description("Initializes CodeQL")
   .requiredOption("--repository <repository>", "Repository name. (Required)")
   .requiredOption("--github-url <url>", "URL of GitHub instance. (Required)")
-  .requiredOption(
+  .option(
     "--github-auth <auth>",
-    "GitHub Apps token or personal access token. (Required)"
+    "GitHub Apps token or personal access token. This option is insecure and deprecated, please use `--github-auth-stdin` instead."
+  )
+  .option(
+    "--github-auth-stdin",
+    "Read GitHub Apps token or personal access token from stdin."
   )
   .option(
     "--languages <languages>",
@@ -146,19 +154,37 @@ program
       fs.rmdirSync(tempDir, { recursive: true });
       fs.mkdirSync(tempDir, { recursive: true });
 
+      const auth = await getGitHubAuth(
+        logger,
+        cmd.githubAuth,
+        cmd.githubAuthStdin
+      );
+
+      const apiDetails = {
+        auth,
+        externalRepoAuth: auth,
+        url: parseGithubUrl(cmd.githubUrl),
+      };
+
+      const gitHubVersion = await getGitHubVersion(apiDetails);
+      if (gitHubVersion !== undefined) {
+        checkGitHubVersionInRange(gitHubVersion, "runner", logger);
+      }
+
       let codeql: CodeQL;
       if (cmd.codeqlPath !== undefined) {
         codeql = getCodeQL(cmd.codeqlPath);
       } else {
-        codeql = await initCodeQL(
-          undefined,
-          cmd.githubAuth,
-          parseGithubUrl(cmd.githubUrl),
-          tempDir,
-          toolsDir,
-          "runner",
-          logger
-        );
+        codeql = (
+          await initCodeQL(
+            undefined,
+            apiDetails,
+            tempDir,
+            toolsDir,
+            "runner",
+            logger
+          )
+        ).codeql;
       }
 
       const config = await initConfig(
@@ -170,9 +196,8 @@ program
         toolsDir,
         codeql,
         cmd.checkoutPath || process.cwd(),
-        cmd.githubAuth,
-        parseGithubUrl(cmd.githubUrl),
-        "runner",
+        gitHubVersion,
+        apiDetails,
         logger
       );
 
@@ -191,7 +216,7 @@ program
         );
       }
 
-      // Always output a json file of the env that can be consumed programatically
+      // Always output a json file of the env that can be consumed programmatically
       const jsonEnvFile = path.join(config.tempDir, codeqlEnvJsonFilename);
       fs.writeFileSync(jsonEnvFile, JSON.stringify(tracerConfig.env));
 
@@ -297,6 +322,7 @@ interface AnalyzeArgs {
   ref: string;
   githubUrl: string;
   githubAuth: string;
+  githubAuthStdin: boolean;
   checkoutPath: string | undefined;
   upload: boolean;
   outputDir: string | undefined;
@@ -317,9 +343,13 @@ program
   )
   .requiredOption("--ref <ref>", "Name of ref that was analyzed. (Required)")
   .requiredOption("--github-url <url>", "URL of GitHub instance. (Required)")
-  .requiredOption(
+  .option(
     "--github-auth <auth>",
-    "GitHub Apps token or personal access token. (Required)"
+    "GitHub Apps token or personal access token. This option is insecure and deprecated, please use `--github-auth-stdin` instead."
+  )
+  .option(
+    "--github-auth-stdin",
+    "Read GitHub Apps token or personal access token from stdin."
   )
   .option(
     "--checkout-path <path>",
@@ -360,24 +390,40 @@ program
             "Was the 'init' command run with the same '--temp-dir' argument as this command."
         );
       }
-      await runAnalyze(
-        parseRepositoryNwo(cmd.repository),
-        cmd.commit,
-        parseRef(cmd.ref),
-        undefined,
-        undefined,
-        undefined,
-        cmd.checkoutPath || process.cwd(),
-        undefined,
+
+      const auth = await getGitHubAuth(
+        logger,
         cmd.githubAuth,
-        parseGithubUrl(cmd.githubUrl),
-        cmd.upload,
-        "runner",
+        cmd.githubAuthStdin
+      );
+
+      const apiDetails = {
+        auth,
+        url: parseGithubUrl(cmd.githubUrl),
+      };
+
+      await runAnalyze(
         outputDir,
         getMemoryFlag(cmd.ram),
         getAddSnippetsFlag(cmd.addSnippets),
         getThreadsFlag(cmd.threads, logger),
         config,
+        logger
+      );
+
+      if (!cmd.upload) {
+        logger.info("Not uploading results");
+        return;
+      }
+
+      await upload_lib.uploadFromRunner(
+        outputDir,
+        parseRepositoryNwo(cmd.repository),
+        cmd.commit,
+        parseRef(cmd.ref),
+        cmd.checkoutPath || process.cwd(),
+        config.gitHubVersion,
+        apiDetails,
         logger
       );
     } catch (e) {
@@ -393,6 +439,7 @@ interface UploadArgs {
   commit: string;
   ref: string;
   githubUrl: string;
+  githubAuthStdin: boolean;
   githubAuth: string;
   checkoutPath: string | undefined;
   debug: boolean;
@@ -414,9 +461,13 @@ program
   )
   .requiredOption("--ref <ref>", "Name of ref that was analyzed. (Required)")
   .requiredOption("--github-url <url>", "URL of GitHub instance. (Required)")
-  .requiredOption(
+  .option(
     "--github-auth <auth>",
-    "GitHub Apps token or personal access token. (Required)"
+    "GitHub Apps token or personal access token. This option is insecure and deprecated, please use `--github-auth-stdin` instead."
+  )
+  .option(
+    "--github-auth-stdin",
+    "Read GitHub Apps token or personal access token from stdin."
   )
   .option(
     "--checkout-path <path>",
@@ -425,20 +476,25 @@ program
   .option("--debug", "Print more verbose output", false)
   .action(async (cmd: UploadArgs) => {
     const logger = getRunnerLogger(cmd.debug);
+    const auth = await getGitHubAuth(
+      logger,
+      cmd.githubAuth,
+      cmd.githubAuthStdin
+    );
+    const apiDetails = {
+      auth,
+      url: parseGithubUrl(cmd.githubUrl),
+    };
     try {
-      await upload_lib.upload(
+      const gitHubVersion = await getGitHubVersion(apiDetails);
+      await upload_lib.uploadFromRunner(
         cmd.sarifFile,
         parseRepositoryNwo(cmd.repository),
         cmd.commit,
         parseRef(cmd.ref),
-        undefined,
-        undefined,
-        undefined,
         cmd.checkoutPath || process.cwd(),
-        undefined,
-        cmd.githubAuth,
-        parseGithubUrl(cmd.githubUrl),
-        "runner",
+        gitHubVersion,
+        apiDetails,
         logger
       );
     } catch (e) {

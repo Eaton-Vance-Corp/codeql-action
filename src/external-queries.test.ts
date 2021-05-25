@@ -1,7 +1,8 @@
 import * as fs from "fs";
 import * as path from "path";
 
-import * as toolrunnner from "@actions/exec/lib/toolrunner";
+import * as toolrunner from "@actions/exec/lib/toolrunner";
+import * as safeWhich from "@chrisgavin/safe-which";
 import test from "ava";
 
 import * as externalQueries from "./external-queries";
@@ -36,17 +37,21 @@ test("checkoutExternalQueries", async (t) => {
       ];
       console.log(`Running: git ${command.join(" ")}`);
       try {
-        await new toolrunnner.ToolRunner("git", command, {
-          silent: true,
-          listeners: {
-            stdout: (data) => {
-              stdout += data.toString();
+        await new toolrunner.ToolRunner(
+          await safeWhich.safeWhich("git"),
+          command,
+          {
+            silent: true,
+            listeners: {
+              stdout: (data) => {
+                stdout += data.toString();
+              },
+              stderr: (data) => {
+                stderr += data.toString();
+              },
             },
-            stderr: (data) => {
-              stderr += data.toString();
-            },
-          },
-        }).exec();
+          }
+        ).exec();
       } catch (e) {
         console.log(`Command failed: git ${command.join(" ")}`);
         process.stderr.write(stderr);
@@ -80,7 +85,7 @@ test("checkoutExternalQueries", async (t) => {
     await externalQueries.checkoutExternalRepository(
       repoName,
       commit1Sha,
-      `file://${testRepoBaseDir}`,
+      { url: `file://${testRepoBaseDir}`, externalRepoAuth: "" },
       tmpDir,
       getRunnerLogger(true)
     );
@@ -94,7 +99,7 @@ test("checkoutExternalQueries", async (t) => {
     await externalQueries.checkoutExternalRepository(
       repoName,
       commit2Sha,
-      `file://${testRepoBaseDir}`,
+      { url: `file://${testRepoBaseDir}`, externalRepoAuth: "" },
       tmpDir,
       getRunnerLogger(true)
     );
@@ -102,4 +107,36 @@ test("checkoutExternalQueries", async (t) => {
     t.true(fs.existsSync(path.join(tmpDir, repoName, commit2Sha, "a")));
     t.false(fs.existsSync(path.join(tmpDir, repoName, commit2Sha, "b")));
   });
+});
+
+test("buildCheckoutURL", (t) => {
+  t.deepEqual(
+    externalQueries.buildCheckoutURL("foo/bar", {
+      url: "https://github.com",
+      externalRepoAuth: undefined,
+    }),
+    "https://github.com/foo/bar"
+  );
+  t.deepEqual(
+    externalQueries.buildCheckoutURL("foo/bar", {
+      url: "https://github.example.com/",
+      externalRepoAuth: undefined,
+    }),
+    "https://github.example.com/foo/bar"
+  );
+
+  t.deepEqual(
+    externalQueries.buildCheckoutURL("foo/bar", {
+      url: "https://github.com",
+      externalRepoAuth: "abc",
+    }),
+    "https://x-access-token:abc@github.com/foo/bar"
+  );
+  t.deepEqual(
+    externalQueries.buildCheckoutURL("foo/bar", {
+      url: "https://github.example.com/",
+      externalRepoAuth: "abc",
+    }),
+    "https://x-access-token:abc@github.example.com/foo/bar"
+  );
 });

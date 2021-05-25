@@ -5,11 +5,13 @@ import zlib from "zlib";
 import * as core from "@actions/core";
 import fileUrl from "file-url";
 import * as jsonschema from "jsonschema";
+import * as semver from "semver";
 
+import * as actionsUtil from "./actions-util";
 import * as api from "./api-client";
 import * as fingerprints from "./fingerprints";
 import { Logger } from "./logging";
-import { RepositoryNwo } from "./repository";
+import { parseRepositoryNwo, RepositoryNwo } from "./repository";
 import * as sharedEnv from "./shared-environment";
 import * as util from "./util";
 
@@ -43,8 +45,7 @@ export function combineSarifFiles(sarifFiles: string[]): string {
 async function uploadPayload(
   payload: any,
   repositoryNwo: RepositoryNwo,
-  githubAuth: string,
-  githubUrl: string,
+  apiDetails: api.GitHubApiDetails,
   mode: util.Mode,
   logger: Logger
 ) {
@@ -56,7 +57,7 @@ async function uploadPayload(
     return;
   }
 
-  const client = api.getApiClient(githubAuth, githubUrl, mode, logger);
+  const client = api.getApiClient(apiDetails);
 
   const reqURL =
     mode === "actions"
@@ -81,58 +82,95 @@ export interface UploadStatusReport {
   num_results_in_sarif?: number;
 }
 
+// Recursively walks a directory and returns all SARIF files it finds.
+// Does not follow symlinks.
+export function findSarifFilesInDir(sarifPath: string): string[] {
+  const sarifFiles: string[] = [];
+  const walkSarifFiles = (dir: string) => {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isFile() && entry.name.endsWith(".sarif")) {
+        sarifFiles.push(path.resolve(dir, entry.name));
+      } else if (entry.isDirectory()) {
+        walkSarifFiles(path.resolve(dir, entry.name));
+      }
+    }
+  };
+  walkSarifFiles(sarifPath);
+  return sarifFiles;
+}
+
 // Uploads a single sarif file or a directory of sarif files
 // depending on what the path happens to refer to.
 // Returns true iff the upload occurred and succeeded
-export async function upload(
+export async function uploadFromActions(
+  sarifPath: string,
+  gitHubVersion: util.GitHubVersion,
+  apiDetails: api.GitHubApiDetails,
+  logger: Logger
+): Promise<UploadStatusReport> {
+  return await uploadFiles(
+    getSarifFilePaths(sarifPath),
+    parseRepositoryNwo(actionsUtil.getRequiredEnvParam("GITHUB_REPOSITORY")),
+    await actionsUtil.getCommitOid(),
+    await actionsUtil.getRef(),
+    await actionsUtil.getAnalysisKey(),
+    actionsUtil.getRequiredEnvParam("GITHUB_WORKFLOW"),
+    actionsUtil.getWorkflowRunID(),
+    actionsUtil.getRequiredInput("checkout_path"),
+    actionsUtil.getRequiredInput("matrix"),
+    gitHubVersion,
+    apiDetails,
+    "actions",
+    logger
+  );
+}
+
+// Uploads a single sarif file or a directory of sarif files
+// depending on what the path happens to refer to.
+// Returns true iff the upload occurred and succeeded
+export async function uploadFromRunner(
   sarifPath: string,
   repositoryNwo: RepositoryNwo,
   commitOid: string,
   ref: string,
-  analysisKey: string | undefined,
-  analysisName: string | undefined,
-  workflowRunID: number | undefined,
   checkoutPath: string,
-  environment: string | undefined,
-  githubAuth: string,
-  githubUrl: string,
-  mode: util.Mode,
+  gitHubVersion: util.GitHubVersion,
+  apiDetails: api.GitHubApiDetails,
   logger: Logger
 ): Promise<UploadStatusReport> {
-  const sarifFiles: string[] = [];
+  return await uploadFiles(
+    getSarifFilePaths(sarifPath),
+    repositoryNwo,
+    commitOid,
+    ref,
+    undefined,
+    undefined,
+    undefined,
+    checkoutPath,
+    undefined,
+    gitHubVersion,
+    apiDetails,
+    "runner",
+    logger
+  );
+}
+
+function getSarifFilePaths(sarifPath: string) {
   if (!fs.existsSync(sarifPath)) {
     throw new Error(`Path does not exist: ${sarifPath}`);
   }
+
+  let sarifFiles: string[];
   if (fs.lstatSync(sarifPath).isDirectory()) {
-    const paths = fs
-      .readdirSync(sarifPath)
-      .filter((f) => f.endsWith(".sarif"))
-      .map((f) => path.resolve(sarifPath, f));
-    for (const path of paths) {
-      sarifFiles.push(path);
-    }
+    sarifFiles = findSarifFilesInDir(sarifPath);
     if (sarifFiles.length === 0) {
       throw new Error(`No SARIF files found to upload in "${sarifPath}".`);
     }
   } else {
-    sarifFiles.push(sarifPath);
+    sarifFiles = [sarifPath];
   }
-
-  return await uploadFiles(
-    sarifFiles,
-    repositoryNwo,
-    commitOid,
-    ref,
-    analysisKey,
-    analysisName,
-    workflowRunID,
-    checkoutPath,
-    environment,
-    githubAuth,
-    githubUrl,
-    mode,
-    logger
-  );
+  return sarifFiles;
 }
 
 // Counts the number of results in the given SARIF file
@@ -170,6 +208,65 @@ export function validateSarifFileSchema(sarifFilePath: string, logger: Logger) {
   }
 }
 
+// buildPayload constructs a map ready to be uploaded to the API from the given
+// parameters, respecting the current mode and target GitHub instance version.
+export function buildPayload(
+  commitOid: string,
+  ref: string,
+  analysisKey: string | undefined,
+  analysisName: string | undefined,
+  zippedSarif: string,
+  workflowRunID: number | undefined,
+  checkoutURI: string,
+  environment: string | undefined,
+  toolNames: string[],
+  gitHubVersion: util.GitHubVersion,
+  mode: util.Mode
+) {
+  if (mode === "actions") {
+    const payloadObj = {
+      commit_oid: commitOid,
+      ref,
+      analysis_key: analysisKey,
+      analysis_name: analysisName,
+      sarif: zippedSarif,
+      workflow_run_id: workflowRunID,
+      checkout_uri: checkoutURI,
+      environment,
+      started_at: process.env[sharedEnv.CODEQL_WORKFLOW_STARTED_AT],
+      tool_names: toolNames,
+      base_ref: undefined as undefined | string,
+      base_sha: undefined as undefined | string,
+    };
+
+    // This behaviour can be made the default when support for GHES 3.0 is discontinued.
+    if (
+      gitHubVersion.type !== util.GitHubVariant.GHES ||
+      semver.satisfies(gitHubVersion.version, `>=3.1`)
+    ) {
+      if (
+        process.env.GITHUB_EVENT_NAME === "pull_request" &&
+        process.env.GITHUB_EVENT_PATH
+      ) {
+        const githubEvent = JSON.parse(
+          fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8")
+        );
+        payloadObj.base_ref = `refs/heads/${githubEvent.pull_request.base.ref}`;
+        payloadObj.base_sha = githubEvent.pull_request.base.sha;
+      }
+    }
+    return payloadObj;
+  } else {
+    return {
+      commit_sha: commitOid,
+      ref,
+      sarif: zippedSarif,
+      checkout_uri: checkoutURI,
+      tool_name: toolNames[0],
+    };
+  }
+}
+
 // Uploads the given set of sarif files.
 // Returns true iff the upload occurred and succeeded
 async function uploadFiles(
@@ -182,8 +279,8 @@ async function uploadFiles(
   workflowRunID: number | undefined,
   checkoutPath: string,
   environment: string | undefined,
-  githubAuth: string,
-  githubUrl: string,
+  gitHubVersion: util.GitHubVersion,
+  apiDetails: api.GitHubApiDetails,
   mode: util.Mode,
   logger: Logger
 ): Promise<UploadStatusReport> {
@@ -212,52 +309,35 @@ async function uploadFiles(
     logger
   );
 
-  const zipped_sarif = zlib.gzipSync(sarifPayload).toString("base64");
+  const zippedSarif = zlib.gzipSync(sarifPayload).toString("base64");
   const checkoutURI = fileUrl(checkoutPath);
 
   const toolNames = util.getToolNames(sarifPayload);
 
-  let payload: string;
-  if (mode === "actions") {
-    payload = JSON.stringify({
-      commit_oid: commitOid,
-      ref,
-      analysis_key: analysisKey,
-      analysis_name: analysisName,
-      sarif: zipped_sarif,
-      workflow_run_id: workflowRunID,
-      checkout_uri: checkoutURI,
-      environment,
-      started_at: process.env[sharedEnv.CODEQL_WORKFLOW_STARTED_AT],
-      tool_names: toolNames,
-    });
-  } else {
-    payload = JSON.stringify({
-      commit_sha: commitOid,
-      ref,
-      sarif: zipped_sarif,
-      checkout_uri: checkoutURI,
-      tool_name: toolNames[0],
-    });
-  }
+  const payload = buildPayload(
+    commitOid,
+    ref,
+    analysisKey,
+    analysisName,
+    zippedSarif,
+    workflowRunID,
+    checkoutURI,
+    environment,
+    toolNames,
+    gitHubVersion,
+    mode
+  );
 
   // Log some useful debug info about the info
   const rawUploadSizeBytes = sarifPayload.length;
   logger.debug(`Raw upload size: ${rawUploadSizeBytes} bytes`);
-  const zippedUploadSizeBytes = zipped_sarif.length;
+  const zippedUploadSizeBytes = zippedSarif.length;
   logger.debug(`Base64 zipped upload size: ${zippedUploadSizeBytes} bytes`);
   const numResultInSarif = countResultsInSarif(sarifPayload);
   logger.debug(`Number of results in upload: ${numResultInSarif}`);
 
   // Make the upload
-  await uploadPayload(
-    payload,
-    repositoryNwo,
-    githubAuth,
-    githubUrl,
-    mode,
-    logger
-  );
+  await uploadPayload(payload, repositoryNwo, apiDetails, mode, logger);
 
   return {
     raw_upload_size_bytes: rawUploadSizeBytes,

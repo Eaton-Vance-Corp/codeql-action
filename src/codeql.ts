@@ -3,14 +3,16 @@ import * as path from "path";
 import * as stream from "stream";
 import * as globalutil from "util";
 
-import * as toolrunnner from "@actions/exec/lib/toolrunner";
+import * as toolrunner from "@actions/exec/lib/toolrunner";
 import * as http from "@actions/http-client";
 import { IHeaders } from "@actions/http-client/interfaces";
 import * as toolcache from "@actions/tool-cache";
+import { default as deepEqual } from "fast-deep-equal";
+import { default as queryString } from "query-string";
 import * as semver from "semver";
 import { v4 as uuidV4 } from "uuid";
 
-import { getRequiredEnvParam } from "./actions-util";
+import { isRunningLocalAction, getRelativeScriptPath } from "./actions-util";
 import * as api from "./api-client";
 import * as defaults from "./defaults.json"; // Referenced from codeql-action-sync-tool!
 import { errorMatchers } from "./error-matcher";
@@ -68,7 +70,7 @@ export interface CodeQL {
   runAutobuild(language: Language): Promise<void>;
   /**
    * Extract code for a scanned language using 'codeql database trace-command'
-   * and running the language extracter.
+   * and running the language extractor.
    */
   extractScannedLanguage(database: string, language: Language): Promise<void>;
   /**
@@ -143,15 +145,10 @@ function getCodeQLActionRepository(mode: util.Mode, logger: Logger): string {
 
   // The Actions Runner used with GitHub Enterprise Server 2.22 did not set the GITHUB_ACTION_REPOSITORY variable.
   // This fallback logic can be removed after the end-of-support for 2.22 on 2021-09-23.
-  const runnerTemp = getRequiredEnvParam("RUNNER_TEMP");
-  const actionsDirectory = path.join(path.dirname(runnerTemp), "_actions");
-  const relativeScriptPath = path.relative(actionsDirectory, __filename);
-  // This handles the case where the Action does not come from an Action repository,
-  // e.g. our integration tests which use the Action code from the current checkout.
-  if (
-    relativeScriptPath.startsWith("..") ||
-    path.isAbsolute(relativeScriptPath)
-  ) {
+
+  if (isRunningLocalAction()) {
+    // This handles the case where the Action does not come from an Action repository,
+    // e.g. our integration tests which use the Action code from the current checkout.
     logger.info(
       "The CodeQL Action is checked out locally. Using the default CodeQL Action repository."
     );
@@ -160,29 +157,30 @@ function getCodeQLActionRepository(mode: util.Mode, logger: Logger): string {
   logger.info(
     "GITHUB_ACTION_REPOSITORY environment variable was not set. Falling back to legacy method of finding the GitHub Action."
   );
-  const relativeScriptPathParts = relativeScriptPath.split(path.sep);
+  const relativeScriptPathParts = getRelativeScriptPath().split(path.sep);
   return `${relativeScriptPathParts[0]}/${relativeScriptPathParts[1]}`;
 }
 
 async function getCodeQLBundleDownloadURL(
-  githubAuth: string,
-  githubUrl: string,
+  apiDetails: api.GitHubApiDetails,
   mode: util.Mode,
   logger: Logger
 ): Promise<string> {
   const codeQLActionRepository = getCodeQLActionRepository(mode, logger);
   const potentialDownloadSources = [
     // This GitHub instance, and this Action.
-    [githubUrl, codeQLActionRepository],
+    [apiDetails.url, codeQLActionRepository],
     // This GitHub instance, and the canonical Action.
-    [githubUrl, CODEQL_DEFAULT_ACTION_REPOSITORY],
+    [apiDetails.url, CODEQL_DEFAULT_ACTION_REPOSITORY],
     // GitHub.com, and the canonical Action.
     [util.GITHUB_DOTCOM_URL, CODEQL_DEFAULT_ACTION_REPOSITORY],
   ];
   // We now filter out any duplicates.
   // Duplicates will happen either because the GitHub instance is GitHub.com, or because the Action is not a fork.
   const uniqueDownloadSources = potentialDownloadSources.filter(
-    (url, index, self) => index === self.indexOf(url)
+    (source, index, self) => {
+      return !self.slice(0, index).some((other) => deepEqual(source, other));
+    }
   );
   const codeQLBundleName = getCodeQLBundleName();
   for (const downloadSource of uniqueDownloadSources) {
@@ -196,13 +194,11 @@ async function getCodeQLBundleDownloadURL(
     }
     const [repositoryOwner, repositoryName] = repository.split("/");
     try {
-      const release = await api
-        .getApiClient(githubAuth, githubUrl, mode, logger, false, true)
-        .repos.getReleaseByTag({
-          owner: repositoryOwner,
-          repo: repositoryName,
-          tag: CODEQL_BUNDLE_VERSION,
-        });
+      const release = await api.getApiClient(apiDetails).repos.getReleaseByTag({
+        owner: repositoryOwner,
+        repo: repositoryName,
+        tag: CODEQL_BUNDLE_VERSION,
+      });
       for (const asset of release.data.assets) {
         if (asset.name === codeQLBundleName) {
           logger.info(
@@ -216,6 +212,31 @@ async function getCodeQLBundleDownloadURL(
         `Looked for CodeQL bundle in ${downloadSource[1]} on ${downloadSource[0]} but got error ${e}.`
       );
     }
+  }
+  try {
+    const release = await api
+      .getApiClient(apiDetails)
+      .request("GET /enterprise/code-scanning/codeql-bundle/find/{tag}", {
+        tag: CODEQL_BUNDLE_VERSION,
+      });
+    const assetID = release.data.assets[codeQLBundleName];
+    if (assetID !== undefined) {
+      const download = await api
+        .getApiClient(apiDetails)
+        .request(
+          "GET /enterprise/code-scanning/codeql-bundle/download/{asset_id}",
+          { asset_id: assetID }
+        );
+      const downloadURL = download.data.url;
+      logger.info(
+        `Found CodeQL bundle at GitHub AE endpoint with URL ${downloadURL}.`
+      );
+      return downloadURL;
+    }
+  } catch (e) {
+    logger.info(
+      `Attempted to fetch bundle from GitHub AE endpoint but got error ${e}.`
+    );
   }
   return `https://github.com/${CODEQL_DEFAULT_ACTION_REPOSITORY}/releases/download/${CODEQL_BUNDLE_VERSION}/${codeQLBundleName}`;
 }
@@ -245,13 +266,12 @@ async function toolcacheDownloadTool(
 
 export async function setupCodeQL(
   codeqlURL: string | undefined,
-  githubAuth: string,
-  githubUrl: string,
+  apiDetails: api.GitHubApiDetails,
   tempDir: string,
   toolsDir: string,
   mode: util.Mode,
   logger: Logger
-): Promise<CodeQL> {
+): Promise<{ codeql: CodeQL; toolsVersion: string }> {
   // Setting these two env vars makes the toolcache code safe to use outside,
   // of actions but this is obviously not a great thing we're doing and it would
   // be better to write our own implementation to use outside of actions.
@@ -267,12 +287,12 @@ export async function setupCodeQL(
     }
 
     const codeqlURLVersion = getCodeQLURLVersion(
-      codeqlURL || `/${CODEQL_BUNDLE_VERSION}/`,
-      logger
+      codeqlURL || `/${CODEQL_BUNDLE_VERSION}/`
     );
+    const codeqlURLSemVer = convertToSemVer(codeqlURLVersion, logger);
 
     // If we find the specified version, we always use that.
-    let codeqlFolder = toolcache.find("CodeQL", codeqlURLVersion);
+    let codeqlFolder = toolcache.find("CodeQL", codeqlURLSemVer);
 
     // If we don't find the requested version, in some cases we may allow a
     // different version to save download time if the version hasn't been
@@ -294,21 +314,22 @@ export async function setupCodeQL(
       logger.debug(`CodeQL found in cache ${codeqlFolder}`);
     } else {
       if (!codeqlURL) {
-        codeqlURL = await getCodeQLBundleDownloadURL(
-          githubAuth,
-          githubUrl,
-          mode,
-          logger
-        );
+        codeqlURL = await getCodeQLBundleDownloadURL(apiDetails, mode, logger);
       }
 
+      const parsedCodeQLURL = new URL(codeqlURL);
+      const parsedQueryString = queryString.parse(parsedCodeQLURL.search);
       const headers: IHeaders = { accept: "application/octet-stream" };
       // We only want to provide an authorization header if we are downloading
       // from the same GitHub instance the Action is running on.
       // This avoids leaking Enterprise tokens to dotcom.
-      if (codeqlURL.startsWith(`${githubUrl}/`)) {
+      // We also don't want to send an authorization header if there's already a token provided in the URL.
+      if (
+        codeqlURL.startsWith(`${apiDetails.url}/`) &&
+        parsedQueryString["token"] === undefined
+      ) {
         logger.debug("Downloading CodeQL bundle with token.");
-        headers.authorization = `token ${githubAuth}`;
+        headers.authorization = `token ${apiDetails.auth}`;
       } else {
         logger.debug("Downloading CodeQL bundle without token.");
       }
@@ -327,7 +348,7 @@ export async function setupCodeQL(
       codeqlFolder = await toolcache.cacheDir(
         codeqlExtracted,
         "CodeQL",
-        codeqlURLVersion
+        codeqlURLSemVer
       );
     }
 
@@ -339,23 +360,24 @@ export async function setupCodeQL(
     }
 
     cachedCodeQL = getCodeQLForCmd(codeqlCmd);
-    return cachedCodeQL;
+    return { codeql: cachedCodeQL, toolsVersion: codeqlURLVersion };
   } catch (e) {
     logger.error(e);
     throw new Error("Unable to download and extract CodeQL CLI");
   }
 }
 
-export function getCodeQLURLVersion(url: string, logger: Logger): string {
+export function getCodeQLURLVersion(url: string): string {
   const match = url.match(/\/codeql-bundle-(.*)\//);
   if (match === null || match.length < 2) {
     throw new Error(
       `Malformed tools url: ${url}. Version could not be inferred`
     );
   }
+  return match[1];
+}
 
-  let version = match[1];
-
+export function convertToSemVer(version: string, logger: Logger): string {
   if (!semver.valid(version)) {
     logger.debug(
       `Bundle version ${version} is not in SemVer format. Will treat it as pre-release 0.0.0-${version}.`
@@ -365,9 +387,7 @@ export function getCodeQLURLVersion(url: string, logger: Logger): string {
 
   const s = semver.clean(version);
   if (!s) {
-    throw new Error(
-      `Malformed tools url ${url}. Version should be in SemVer format but have ${version} instead`
-    );
+    throw new Error(`Bundle version ${version} is not in SemVer format.`);
   }
 
   return s;
@@ -444,10 +464,7 @@ function getCodeQLForCmd(cmd: string): CodeQL {
       return cmd;
     },
     async printVersion() {
-      await new toolrunnner.ToolRunner(cmd, [
-        "version",
-        "--format=json",
-      ]).exec();
+      await new toolrunner.ToolRunner(cmd, ["version", "--format=json"]).exec();
     },
     async getTracerEnv(databasePath: string) {
       // Write tracer-env.js to a temp location.
@@ -474,7 +491,7 @@ function getCodeQLForCmd(cmd: string): CodeQL {
       );
 
       const envFile = path.resolve(databasePath, "working", "env.tmp");
-      await new toolrunnner.ToolRunner(cmd, [
+      await new toolrunner.ToolRunner(cmd, [
         "database",
         "trace-command",
         databasePath,
@@ -490,7 +507,7 @@ function getCodeQLForCmd(cmd: string): CodeQL {
       language: Language,
       sourceRoot: string
     ) {
-      await new toolrunnner.ToolRunner(cmd, [
+      await new toolrunner.ToolRunner(cmd, [
         "database",
         "init",
         databasePath,
@@ -521,12 +538,12 @@ function getCodeQLForCmd(cmd: string): CodeQL {
         "-Dmaven.wagon.http.pool=false",
       ].join(" ");
 
-      await new toolrunnner.ToolRunner(autobuildCmd).exec();
+      await new toolrunner.ToolRunner(autobuildCmd).exec();
     },
     async extractScannedLanguage(databasePath: string, language: Language) {
       // Get extractor location
       let extractorPath = "";
-      await new toolrunnner.ToolRunner(
+      await new toolrunner.ToolRunner(
         cmd,
         [
           "resolve",
@@ -598,7 +615,7 @@ function getCodeQLForCmd(cmd: string): CodeQL {
         codeqlArgs.push("--search-path", extraSearchPath);
       }
       let output = "";
-      await new toolrunnner.ToolRunner(cmd, codeqlArgs, {
+      await new toolrunner.ToolRunner(cmd, codeqlArgs, {
         listeners: {
           stdout: (data: Buffer) => {
             output += data.toString();
@@ -616,7 +633,7 @@ function getCodeQLForCmd(cmd: string): CodeQL {
       addSnippetsFlag: string,
       threadsFlag: string
     ) {
-      await new toolrunnner.ToolRunner(cmd, [
+      await new toolrunner.ToolRunner(cmd, [
         "database",
         "analyze",
         memoryFlag,
@@ -624,6 +641,7 @@ function getCodeQLForCmd(cmd: string): CodeQL {
         databasePath,
         "--min-disk-free=1024", // Try to leave at least 1GB free
         "--format=sarif-latest",
+        "--sarif-multicause-markdown",
         `--output=${sarifFile}`,
         addSnippetsFlag,
         ...getExtraOptionsFromEnv(["database", "analyze"]),
@@ -636,9 +654,36 @@ function getCodeQLForCmd(cmd: string): CodeQL {
 /**
  * Gets the options for `path` of `options` as an array of extra option strings.
  */
-function getExtraOptionsFromEnv(path: string[]) {
+function getExtraOptionsFromEnv(paths: string[]) {
   const options: ExtraOptions = util.getExtraOptionsEnvParam();
-  return getExtraOptions(options, path, []);
+  return getExtraOptions(options, paths, []);
+}
+
+/**
+ * Gets `options` as an array of extra option strings.
+ *
+ * - throws an exception mentioning `pathInfo` if this conversion is impossible.
+ */
+function asExtraOptions(options: any, pathInfo: string[]): string[] {
+  if (options === undefined) {
+    return [];
+  }
+  if (!Array.isArray(options)) {
+    const msg = `The extra options for '${pathInfo.join(
+      "."
+    )}' ('${JSON.stringify(options)}') are not in an array.`;
+    throw new Error(msg);
+  }
+  return options.map((o) => {
+    const t = typeof o;
+    if (t !== "string" && t !== "number" && t !== "boolean") {
+      const msg = `The extra option for '${pathInfo.join(
+        "."
+      )}' ('${JSON.stringify(o)}') is not a primitive value.`;
+      throw new Error(msg);
+    }
+    return `${o}`;
+  });
 }
 
 /**
@@ -651,43 +696,17 @@ function getExtraOptionsFromEnv(path: string[]) {
  */
 export function getExtraOptions(
   options: any,
-  path: string[],
+  paths: string[],
   pathInfo: string[]
 ): string[] {
-  /**
-   * Gets `options` as an array of extra option strings.
-   *
-   * - throws an exception mentioning `pathInfo` if this conversion is impossible.
-   */
-  function asExtraOptions(options: any, pathInfo: string[]): string[] {
-    if (options === undefined) {
-      return [];
-    }
-    if (!Array.isArray(options)) {
-      const msg = `The extra options for '${pathInfo.join(
-        "."
-      )}' ('${JSON.stringify(options)}') are not in an array.`;
-      throw new Error(msg);
-    }
-    return options.map((o) => {
-      const t = typeof o;
-      if (t !== "string" && t !== "number" && t !== "boolean") {
-        const msg = `The extra option for '${pathInfo.join(
-          "."
-        )}' ('${JSON.stringify(o)}') is not a primitive value.`;
-        throw new Error(msg);
-      }
-      return `${o}`;
-    });
-  }
   const all = asExtraOptions(options?.["*"], pathInfo.concat("*"));
   const specific =
-    path.length === 0
+    paths.length === 0
       ? asExtraOptions(options, pathInfo)
       : getExtraOptions(
-          options?.[path[0]],
-          path?.slice(1),
-          pathInfo.concat(path[0])
+          options?.[paths[0]],
+          paths?.slice(1),
+          pathInfo.concat(paths[0])
         );
   return all.concat(specific);
 }

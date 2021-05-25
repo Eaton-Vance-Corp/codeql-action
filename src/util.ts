@@ -1,7 +1,13 @@
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { Readable } from "stream";
 
+import * as core from "@actions/core";
+import * as semver from "semver";
+
+import { getApiClient, GitHubApiDetails } from "./api-client";
+import * as apiCompatibility from "./api-compatibility.json";
 import { Language } from "./languages";
 import { Logger } from "./logging";
 
@@ -13,7 +19,7 @@ export type Mode = "actions" | "runner";
 /**
  * The URL for github.com.
  */
-export const GITHUB_DOTCOM_URL = "https://github.com";
+export const GITHUB_DOTCOM_URL = "https://github.com/";
 
 /**
  * Get the extra options for the codeql commands.
@@ -77,8 +83,21 @@ export async function withTmpDir<T>(
 }
 
 /**
+ * Gets an OS-specific amount of memory (in MB) to reserve for OS processes
+ * when the user doesn't explicitly specify a memory setting.
+ * This is a heuristic to avoid OOM errors (exit code 137 / SIGKILL)
+ * from committing too much of the available memory to CodeQL.
+ * @returns number
+ */
+function getSystemReservedMemoryMegaBytes(): number {
+  // Windows needs more memory for OS processes.
+  return 1024 * (process.platform === "win32" ? 1.5 : 1);
+}
+
+/**
  * Get the codeql `--ram` flag as configured by the `ram` input. If no value was
- * specified, the total available memory will be used minus 256 MB.
+ * specified, the total available memory will be used minus a threshold
+ * reserved for the OS.
  *
  * @returns string
  */
@@ -92,8 +111,8 @@ export function getMemoryFlag(userInput: string | undefined): string {
   } else {
     const totalMemoryBytes = os.totalmem();
     const totalMemoryMegaBytes = totalMemoryBytes / (1024 * 1024);
-    const systemReservedMemoryMegaBytes = 256;
-    memoryToUseMegaBytes = totalMemoryMegaBytes - systemReservedMemoryMegaBytes;
+    const reservedMemoryMegaBytes = getSystemReservedMemoryMegaBytes();
+    memoryToUseMegaBytes = totalMemoryMegaBytes - reservedMemoryMegaBytes;
   }
   return `--ram=${Math.floor(memoryToUseMegaBytes)}`;
 }
@@ -207,4 +226,167 @@ export function parseGithubUrl(inputUrl: string): string {
   }
 
   return url.toString();
+}
+
+const GITHUB_ENTERPRISE_VERSION_HEADER = "x-github-enterprise-version";
+const CODEQL_ACTION_WARNED_ABOUT_VERSION_ENV_VAR =
+  "CODEQL_ACTION_WARNED_ABOUT_VERSION";
+let hasBeenWarnedAboutVersion = false;
+
+export enum GitHubVariant {
+  DOTCOM,
+  GHES,
+  GHAE,
+}
+export type GitHubVersion =
+  | { type: GitHubVariant.DOTCOM }
+  | { type: GitHubVariant.GHAE }
+  | { type: GitHubVariant.GHES; version: string };
+
+export async function getGitHubVersion(
+  apiDetails: GitHubApiDetails
+): Promise<GitHubVersion> {
+  // We can avoid making an API request in the standard dotcom case
+  if (parseGithubUrl(apiDetails.url) === GITHUB_DOTCOM_URL) {
+    return { type: GitHubVariant.DOTCOM };
+  }
+
+  // Doesn't strictly have to be the meta endpoint as we're only
+  // using the response headers which are available on every request.
+  const apiClient = getApiClient(apiDetails);
+  const response = await apiClient.meta.get();
+
+  // This happens on dotcom, although we expect to have already returned in that
+  // case. This can also serve as a fallback in cases we haven't foreseen.
+  if (response.headers[GITHUB_ENTERPRISE_VERSION_HEADER] === undefined) {
+    return { type: GitHubVariant.DOTCOM };
+  }
+
+  if (response.headers[GITHUB_ENTERPRISE_VERSION_HEADER] === "GitHub AE") {
+    return { type: GitHubVariant.GHAE };
+  }
+
+  const version = response.headers[GITHUB_ENTERPRISE_VERSION_HEADER] as string;
+  return { type: GitHubVariant.GHES, version };
+}
+
+export function checkGitHubVersionInRange(
+  version: GitHubVersion,
+  mode: Mode,
+  logger: Logger
+) {
+  if (hasBeenWarnedAboutVersion || version.type !== GitHubVariant.GHES) {
+    return;
+  }
+
+  const disallowedAPIVersionReason = apiVersionInRange(
+    version.version,
+    apiCompatibility.minimumVersion,
+    apiCompatibility.maximumVersion
+  );
+
+  const toolName = mode === "actions" ? "Action" : "Runner";
+
+  if (
+    disallowedAPIVersionReason === DisallowedAPIVersionReason.ACTION_TOO_OLD
+  ) {
+    logger.warning(
+      `The CodeQL ${toolName} version you are using is too old to be compatible with GitHub Enterprise ${version.version}. If you experience issues, please upgrade to a more recent version of the CodeQL ${toolName}.`
+    );
+  }
+  if (
+    disallowedAPIVersionReason === DisallowedAPIVersionReason.ACTION_TOO_NEW
+  ) {
+    logger.warning(
+      `GitHub Enterprise ${version.version} is too old to be compatible with this version of the CodeQL ${toolName}. If you experience issues, please upgrade to a more recent version of GitHub Enterprise or use an older version of the CodeQL ${toolName}.`
+    );
+  }
+  hasBeenWarnedAboutVersion = true;
+  if (mode === "actions") {
+    core.exportVariable(CODEQL_ACTION_WARNED_ABOUT_VERSION_ENV_VAR, true);
+  }
+}
+
+export enum DisallowedAPIVersionReason {
+  ACTION_TOO_OLD,
+  ACTION_TOO_NEW,
+}
+
+export function apiVersionInRange(
+  version: string,
+  minimumVersion: string,
+  maximumVersion: string
+): DisallowedAPIVersionReason | undefined {
+  if (!semver.satisfies(version, `>=${minimumVersion}`)) {
+    return DisallowedAPIVersionReason.ACTION_TOO_NEW;
+  }
+  if (!semver.satisfies(version, `<=${maximumVersion}`)) {
+    return DisallowedAPIVersionReason.ACTION_TOO_OLD;
+  }
+  return undefined;
+}
+
+/**
+ * Retrieves the github auth token for use with the runner. There are
+ * three possible locations for the token:
+ *
+ * 1. from the cli (considered insecure)
+ * 2. from stdin
+ * 3. from the GITHUB_TOKEN environment variable
+ *
+ * If both 1 & 2 are specified, then an error is thrown.
+ * If 1 & 3 or 2 & 3 are specified, then the environment variable is ignored.
+ *
+ * @param githubAuth a github app token or PAT
+ * @param fromStdIn read the github app token or PAT from stdin up to, but excluding the first whitespace
+ * @param readable the readable stream to use for getting the token (defaults to stdin)
+ *
+ * @return a promise resolving to the auth token.
+ */
+export async function getGitHubAuth(
+  logger: Logger,
+  githubAuth: string | undefined,
+  fromStdIn: boolean | undefined,
+  readable = process.stdin as Readable
+): Promise<string> {
+  if (githubAuth && fromStdIn) {
+    throw new Error(
+      "Cannot specify both `--github-auth` and `--github-auth-stdin`. Please use `--github-auth-stdin`, which is more secure."
+    );
+  }
+
+  if (githubAuth) {
+    logger.warning(
+      "Using `--github-auth` via the CLI is insecure. Use `--github-auth-stdin` instead."
+    );
+    return githubAuth;
+  }
+
+  if (fromStdIn) {
+    return new Promise((resolve, reject) => {
+      let token = "";
+      readable.on("data", (data) => {
+        token += data.toString("utf8");
+      });
+      readable.on("end", () => {
+        token = token.split(/\s+/)[0].trim();
+        if (token) {
+          resolve(token);
+        } else {
+          reject(new Error("Standard input is empty"));
+        }
+      });
+      readable.on("error", (err) => {
+        reject(err);
+      });
+    });
+  }
+
+  if (process.env.GITHUB_TOKEN) {
+    return process.env.GITHUB_TOKEN;
+  }
+
+  throw new Error(
+    "No GitHub authentication token was specified. Please provide a token via the GITHUB_TOKEN environment variable, or by adding the `--github-auth-stdin` flag and passing the token via standard input."
+  );
 }

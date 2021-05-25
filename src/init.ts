@@ -1,9 +1,11 @@
 import * as fs from "fs";
 import * as path from "path";
 
-import * as toolrunnner from "@actions/exec/lib/toolrunner";
+import * as toolrunner from "@actions/exec/lib/toolrunner";
+import * as safeWhich from "@chrisgavin/safe-which";
 
 import * as analysisPaths from "./analysis-paths";
+import { GitHubApiCombinedDetails, GitHubApiDetails } from "./api-client";
 import { CodeQL, setupCodeQL } from "./codeql";
 import * as configUtils from "./config-utils";
 import { Logger } from "./logging";
@@ -13,18 +15,16 @@ import * as util from "./util";
 
 export async function initCodeQL(
   codeqlURL: string | undefined,
-  githubAuth: string,
-  githubUrl: string,
+  apiDetails: GitHubApiDetails,
   tempDir: string,
   toolsDir: string,
   mode: util.Mode,
   logger: Logger
-): Promise<CodeQL> {
+): Promise<{ codeql: CodeQL; toolsVersion: string }> {
   logger.startGroup("Setup CodeQL tools");
-  const codeql = await setupCodeQL(
+  const { codeql, toolsVersion } = await setupCodeQL(
     codeqlURL,
-    githubAuth,
-    githubUrl,
+    apiDetails,
     tempDir,
     toolsDir,
     mode,
@@ -32,7 +32,7 @@ export async function initCodeQL(
   );
   await codeql.printVersion();
   logger.endGroup();
-  return codeql;
+  return { codeql, toolsVersion };
 }
 
 export async function initConfig(
@@ -44,9 +44,8 @@ export async function initConfig(
   toolCacheDir: string,
   codeQL: CodeQL,
   checkoutPath: string,
-  githubAuth: string,
-  githubUrl: string,
-  mode: util.Mode,
+  gitHubVersion: util.GitHubVersion,
+  apiDetails: GitHubApiCombinedDetails,
   logger: Logger
 ): Promise<configUtils.Config> {
   logger.startGroup("Load language configuration");
@@ -59,9 +58,8 @@ export async function initConfig(
     toolCacheDir,
     codeQL,
     checkoutPath,
-    githubAuth,
-    githubUrl,
-    mode,
+    gitHubVersion,
+    apiDetails,
     logger
   );
   analysisPaths.printPathFiltersWarning(config, logger);
@@ -171,8 +169,8 @@ export async function injectWindowsTracer(
   const injectTracerPath = path.join(config.tempDir, "inject-tracer.ps1");
   fs.writeFileSync(injectTracerPath, script);
 
-  await new toolrunnner.ToolRunner(
-    "powershell",
+  await new toolrunner.ToolRunner(
+    await safeWhich.safeWhich("powershell"),
     [
       "-ExecutionPolicy",
       "Bypass",
@@ -198,11 +196,12 @@ export async function installPythonDeps(codeql: CodeQL, logger: Logger) {
   if (process.env["ImageOS"] !== undefined) {
     try {
       if (process.platform === "win32") {
-        await new toolrunnner.ToolRunner("powershell", [
-          path.join(scriptsFolder, "install_tools.ps1"),
-        ]).exec();
+        await new toolrunner.ToolRunner(
+          await safeWhich.safeWhich("powershell"),
+          [path.join(scriptsFolder, "install_tools.ps1")]
+        ).exec();
       } else {
-        await new toolrunnner.ToolRunner(
+        await new toolrunner.ToolRunner(
           path.join(scriptsFolder, "install_tools.sh")
         ).exec();
       }
@@ -211,7 +210,7 @@ export async function installPythonDeps(codeql: CodeQL, logger: Logger) {
       // we just abort the process without failing the action
       logger.endGroup();
       logger.warning(
-        "Unable to download and extract the tools needed for installing the python dependecies. You can call this action with 'setup-python-dependencies: false' to disable this process."
+        "Unable to download and extract the tools needed for installing the python dependencies. You can call this action with 'setup-python-dependencies: false' to disable this process."
       );
       return;
     }
@@ -221,13 +220,13 @@ export async function installPythonDeps(codeql: CodeQL, logger: Logger) {
   try {
     const script = "auto_install_packages.py";
     if (process.platform === "win32") {
-      await new toolrunnner.ToolRunner("py", [
+      await new toolrunner.ToolRunner(await safeWhich.safeWhich("py"), [
         "-3",
         path.join(scriptsFolder, script),
         path.dirname(codeql.getPath()),
       ]).exec();
     } else {
-      await new toolrunnner.ToolRunner(path.join(scriptsFolder, script), [
+      await new toolrunner.ToolRunner(path.join(scriptsFolder, script), [
         path.dirname(codeql.getPath()),
       ]).exec();
     }
