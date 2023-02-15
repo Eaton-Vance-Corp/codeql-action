@@ -44,7 +44,7 @@ jobs:
                -H "Accept: application/json" \
                -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" | jq .upload_url | sed s/\"//g)
           echo ${UPLOAD_URL}
-          echo "::set-output name=upload_url::${UPLOAD_URL}"
+          echo "upload_url=${UPLOAD_URL}" >> $GITHUB_OUTPUT
 
       - name: Download CodeQL CLI and Bundle
         run: |

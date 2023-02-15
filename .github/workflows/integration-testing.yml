@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
     - name: Move codeql-action
       shell: bash
       run: |
@@ -48,7 +48,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
     - name: Move codeql-action
       shell: bash
       run: |
@@ -80,7 +80,7 @@ jobs:
       if: ${{ matrix.os ==  'macos-latest' }}
       with:
         go-version: '^1.13.1'
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
     - name: Move codeql-action
       shell: bash
       run: |
@@ -102,7 +102,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
     - name: Move codeql-action
       shell: bash
       run: |
@@ -142,7 +142,7 @@ jobs:
     env:
       https_proxy: http://squid-proxy:3128
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
     - name: Move codeql-action
       shell: bash
       run: |
@@ -160,7 +160,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
 
     - name: Build runner
       run: |
@@ -186,7 +186,7 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
 
     - name: Build runner
       run: |
@@ -208,7 +208,7 @@ jobs:
     runs-on: macos-latest
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
 
     - name: Build runner
       run: |
@@ -230,7 +230,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
 
     - name: Move codeql-action
       shell: bash
@@ -264,7 +264,7 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
 
     - name: Move codeql-action
       shell: bash
@@ -299,7 +299,7 @@ jobs:
     runs-on: macos-latest
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
 
     - name: Move codeql-action
       shell: bash
@@ -335,7 +335,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
 
     - name: Move codeql-action
       shell: bash
@@ -368,7 +368,7 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
 
     - name: Move codeql-action
       shell: bash
@@ -402,7 +402,7 @@ jobs:
     runs-on: macos-latest
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
 
     - name: Move codeql-action
       shell: bash
@@ -436,7 +436,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
 
     - name: Build runner
       run: |
